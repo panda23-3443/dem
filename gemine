@@ -1,0 +1,407 @@
+-- spi_master.vhd
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity spi_master is
+    generic (
+        CLK_FREQ    : integer := 200_000_000; -- KC705 sistem saati: 200 MHz
+        SPI_FREQ    : integer := 10_000_000   -- SPI haberleşme hızı: 10 MHz
+    );
+    port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        -- Kontrol Arayüzü
+        start_tx    : in  std_logic; -- Gönderimi başlat
+        data_to_send: in  std_logic_vector(23 downto 0); -- Gönderilecek 24-bit veri
+        tx_done     : out std_logic; -- Gönderim tamamlandı sinyali
+        busy        : out std_logic; -- Modül meşgul sinyali
+        -- SPI Pinleri
+        spi_sclk    : out std_logic;
+        spi_mosi    : out std_logic;
+        spi_cs      : out std_logic
+    );
+end spi_master;
+
+architecture Behavioral of spi_master is
+    constant DIVIDER      : integer := CLK_FREQ / (2 * SPI_FREQ);
+    signal sclk_reg     : std_logic := '0';
+    signal sclk_counter : integer range 0 to DIVIDER := 0;
+    signal bit_counter  : integer range 0 to 24 := 0;
+    signal tx_buffer    : std_logic_vector(23 downto 0);
+    
+    type T_STATE is (IDLE, START_TRANSFER, TRANSFER, END_TRANSFER);
+    signal state : T_STATE := IDLE;
+
+begin
+
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                state <= IDLE;
+                sclk_counter <= 0;
+                bit_counter <= 0;
+                spi_cs <= '1';
+                spi_sclk <= '0';
+                busy <= '0';
+                tx_done <= '0';
+            else
+                tx_done <= '0'; -- Tek pals olarak kalması için
+
+                case state is
+                    when IDLE =>
+                        spi_cs <= '1';
+                        busy <= '0';
+                        if start_tx = '1' then
+                            tx_buffer <= data_to_send;
+                            state <= START_TRANSFER;
+                            busy <= '1';
+                        end if;
+
+                    when START_TRANSFER =>
+                        spi_cs <= '0';
+                        bit_counter <= 24;
+                        sclk_counter <= 0;
+                        state <= TRANSFER;
+
+                    when TRANSFER =>
+                        if sclk_counter = (DIVIDER - 1) then
+                            sclk_counter <= 0;
+                            sclk_reg <= not sclk_reg;
+                            
+                            -- SCLK'nın düşen kenarında veriyi değiştir
+                            if sclk_reg = '1' then 
+                                spi_mosi <= tx_buffer(bit_counter - 1);
+                                if bit_counter > 0 then
+                                    bit_counter <= bit_counter - 1;
+                                end if;
+                            end if;
+                        else
+                            sclk_counter <= sclk_counter + 1;
+                        end if;
+                        
+                        if bit_counter = 0 then
+                           state <= END_TRANSFER;
+                        end if;
+
+                    when END_TRANSFER =>
+                        spi_cs <= '1';
+                        tx_done <= '1';
+                        state <= IDLE;
+                end case;
+            end if;
+        end if;
+    end process;
+    
+    spi_sclk <= sclk_reg when state = TRANSFER else '0';
+
+end Behavioral;
+-- dac_controller.vhd
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity dac_controller is
+    port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        -- SPI Arayüzü
+        spi_sclk    : out std_logic;
+        spi_mosi    : out std_logic;
+        spi_cs      : out std_logic
+    );
+end dac_controller;
+
+architecture Behavioral of dac_controller is
+    
+    component spi_master is
+        port (
+            clk         : in  std_logic;
+            reset       : in  std_logic;
+            start_tx    : in  std_logic;
+            data_to_send: in  std_logic_vector(23 downto 0);
+            tx_done     : out std_logic;
+            busy        : out std_logic;
+            spi_sclk    : out std_logic;
+            spi_mosi    : out std_logic;
+            spi_cs      : out std_logic
+        );
+    end component;
+    
+    -- AD3552R Komutları (Datasheet'e göre doldurulacak)
+    -- Bu değerler örnek olarak verilmiştir, datasheet'ten kontrol EDİN!
+    constant CMD_WRITE_REG  : std_logic_vector(7 downto 0) := x"01"; -- Yazma komutu
+    constant ADDR_CONFIG    : std_logic_vector(7 downto 0) := x"02"; -- DAC_CONFIG yazmaç adresi
+    constant ADDR_DAC_DATA  : std_logic_vector(7 downto 0) := x"01"; -- DAC_DATA yazmaç adresi
+    
+    -- 0-5V aralığını ayarlayan veri (Datasheet'e göre doldurulacak)
+    constant CONFIG_DATA_0_5V : std_logic_vector(7 downto 0) := x"11"; -- Örnek değer
+    
+    -- 2.5V çıkış için DAC verisi (16-bit)
+    constant DAC_VAL_2_5V   : std_logic_vector(15 downto 0) := x"8000";
+    
+    signal s_start_tx       : std_logic := '0';
+    signal s_tx_done        : std_logic;
+    signal s_busy           : std_logic;
+    signal s_data_to_send   : std_logic_vector(23 downto 0);
+    
+    type T_STATE is (IDLE, INIT_WAIT, SET_RANGE, WAIT_RANGE_DONE, SET_VOLTAGE, WAIT_VOLTAGE_DONE, RUNNING);
+    signal state : T_STATE := IDLE;
+    
+    signal wait_counter : unsigned(27 downto 0) := (others => '0'); -- Bekleme sayacı
+
+begin
+
+    spi_inst : spi_master
+        port map (
+            clk          => clk,
+            reset        => reset,
+            start_tx     => s_start_tx,
+            data_to_send => s_data_to_send,
+            tx_done      => s_tx_done,
+            busy         => s_busy,
+            spi_sclk     => spi_sclk,
+            spi_mosi     => spi_mosi,
+            spi_cs       => spi_cs
+        );
+        
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            if reset = '1' then
+                state <= IDLE;
+                s_start_tx <= '0';
+                wait_counter <= (others => '0');
+            else
+                -- Start sinyalini sadece bir saat döngüsü aktif tut
+                if s_start_tx = '1' then
+                    s_start_tx <= '0';
+                end if;
+            
+                case state is
+                    when IDLE =>
+                        -- Güç geldikten sonra DAC'ın stabil olması için bekle (örn. 1 saniye)
+                        if wait_counter < 200_000_000 then -- 200MHz saat ile 1 saniye
+                            wait_counter <= wait_counter + 1;
+                        else
+                            state <= INIT_WAIT;
+                        end if;
+
+                    when INIT_WAIT =>
+                        -- Yazmaçlara yazmadan önce kısa bir süre bekle
+                        wait_counter <= wait_counter + 1;
+                        if wait_counter(10) = '1' then -- Kısa bir bekleme
+                           state <= SET_RANGE;
+                        end if;
+
+                    when SET_RANGE =>
+                        -- Çıkış aralığını 0-5V olarak ayarla
+                        -- Komut: [Yazma Komutu (8-bit)][Adres (8-bit)][Veri (8-bit)]
+                        s_data_to_send <= CMD_WRITE_REG & ADDR_CONFIG & CONFIG_DATA_0_5V;
+                        s_start_tx <= '1';
+                        state <= WAIT_RANGE_DONE;
+                        
+                    when WAIT_RANGE_DONE =>
+                        if s_tx_done = '1' then
+                            state <= SET_VOLTAGE;
+                        end if;
+                        
+                    when SET_VOLTAGE =>
+                        -- DAC çıkış voltajını ayarla (2.5V)
+                        -- Komut: [Yazma Komutu (8-bit)][Adres (8-bit)][Veri (MSB 8-bit)]
+                        -- Sonraki Komut: [Veri (LSB 8-bit)] -- AD3552R datasheet'ine göre bu kısım değişebilir!
+                        -- Eğer 16 bit veri tek komutta yazılıyorsa:
+                        s_data_to_send <= CMD_WRITE_REG & ADDR_DAC_DATA & DAC_VAL_2_5V(15 downto 8) & DAC_VAL_2_5V(7 downto 0); -- Bu formatı datasheet'ten doğrulayın!
+                        s_start_tx <= '1';
+                        state <= WAIT_VOLTAGE_DONE;
+
+                    when WAIT_VOLTAGE_DONE =>
+                        if s_tx_done = '1' then
+                            state <= RUNNING;
+                        end if;
+
+                    when RUNNING =>
+                        -- Artık DAC ayarlandı. İstenirse burada voltaj değiştirilebilir.
+                        -- Bu örnekte sabit kalıyor.
+                        null;
+                        
+                end case;
+            end if;
+        end if;
+    end process;
+
+end Behavioral;
+-- top_level.vhd
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+entity top_level is
+    port (
+        sys_clk_p   : in  std_logic; -- Sistem saati (pozitif)
+        sys_clk_n   : in  std_logic; -- Sistem saati (negatif)
+        reset_btn   : in  std_logic; -- Reset butonu
+        
+        -- DAC pinleri (FMC konnektörüne giden)
+        fmc_sclk    : out std_logic;
+        fmc_mosi    : out std_logic;
+        fmc_cs      : out std_logic
+    );
+end top_level;
+
+architecture Behavioral of top_level is
+
+    component dac_controller is
+        port (
+            clk         : in  std_logic;
+            reset       : in  std_logic;
+            spi_sclk    : out std_logic;
+            spi_mosi    : out std_logic;
+            spi_cs      : out std_logic
+        );
+    end component;
+    
+    signal clk_200mhz : std_logic;
+    signal reset      : std_logic;
+
+begin
+
+    -- Diferansiyel sistem saatini tek uca çevir
+    -- Vivado'da bunun için "Clocking Wizard" IP'sini kullanmak daha sağlıklıdır.
+    -- Bu basit bir örneklemedir:
+    process(sys_clk_p)
+    begin
+        if rising_edge(sys_clk_p) then
+            clk_200mhz <= '1';
+        elsif falling_edge(sys_clk_p) then
+            clk_200mhz <= '0';
+        end if;
+    end process;
+    -- Not: Gerçek bir tasarımda IBUFDS gibi bir ilkel (primitive) kullanılır.
+    -- IBUFDS_inst : IBUFDS
+    -- port map (
+    --    O => clk_200mhz,
+    --    I => sys_clk_p,
+    --    IB => sys_clk_n
+    -- );
+
+    reset <= reset_btn; -- Reset butonu genellikle aktif-yüksek (active-high) olur.
+    
+    controller_inst : dac_controller
+        port map (
+            clk      => clk_200mhz,
+            reset    => reset,
+            spi_sclk => fmc_sclk,
+            spi_mosi => fmc_mosi,
+            spi_cs   => fmc_cs
+        );
+
+end Behavioral;
+# constraints.xdc
+
+# Sistem Saati (200MHz) - Örnek pinler
+set_property PACKAGE_PIN AD12 [get_ports sys_clk_p]
+set_property PACKAGE_PIN AD11 [get_ports sys_clk_n]
+set_property IOSTANDARD LVDS [get_ports {sys_clk_p sys_clk_n}]
+create_clock -period 5.000 -name sys_clk_pin [get_ports sys_clk_p]
+
+# Reset Butonu (CPU_RESET) - Örnek pin
+set_property PACKAGE_PIN AB7 [get_ports reset_btn]
+set_property IOSTANDARD LVCMOS15 [get_ports reset_btn]
+
+# FMC LPC Konnektöründeki SPI Pinleri - ÖRNEK PINLER! KILAVUZDAN KONTROL EDİN!
+# Bu pinler FMC LPC LA00-LA03 pinlerine karşılık gelebilir.
+set_property PACKAGE_PIN AB6 [get_ports fmc_cs]
+set_property PACKAGE_PIN Y8  [get_ports fmc_sclk]
+set_property PACKAGE_PIN AA8 [get_ports fmc_mosi]
+
+# Bu pinlerin kullandığı voltaj standardı FMC kartına göre ayarlanmalıdır (genellikle LVCMOS25 veya LVCMOS18)
+set_property IOSTANDARD LVCMOS25 [get_ports {fmc_cs fmc_sclk fmc_mosi}]
+-- tb_top_level.vhd
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+-- Test bench entity'sinin portu olmaz.
+entity tb_top_level is
+end tb_top_level;
+
+architecture simulation of tb_top_level is
+
+    -- 1. Test edilecek component'i (DUT) tanımla
+    component top_level is
+        port (
+            sys_clk_p   : in  std_logic;
+            sys_clk_n   : in  std_logic;
+            reset_btn   : in  std_logic;
+            fmc_sclk    : out std_logic;
+            fmc_mosi    : out std_logic;
+            fmc_cs      : out std_logic
+        );
+    end component;
+
+    -- 2. DUT'un portlarına bağlanacak sinyalleri oluştur
+    -- Girişler
+    signal s_sys_clk_p : std_logic := '0';
+    signal s_sys_clk_n : std_logic := '1';
+    signal s_reset_btn : std_logic := '0';
+    
+    -- Çıkışlar
+    signal s_fmc_sclk  : std_logic;
+    signal s_fmc_mosi  : std_logic;
+    signal s_fmc_cs    : std_logic;
+
+    -- 3. Sabitleri tanımla
+    -- 200 MHz saat sinyalinin periyodu 5 ns'dir.
+    constant CLK_PERIOD : time := 5 ns;
+
+begin
+
+    -- 4. DUT'u instantiate et (örneğini oluştur) ve sinyalleri portlarına bağla
+    uut: top_level
+        port map (
+            sys_clk_p => s_sys_clk_p,
+            sys_clk_n => s_sys_clk_n,
+            reset_btn => s_reset_btn,
+            fmc_sclk  => s_fmc_sclk,
+            fmc_mosi  => s_fmc_mosi,
+            fmc_cs    => s_fmc_cs
+        );
+
+    -- 5. Periyodik saat sinyalini üreten process
+    clk_process : process
+    begin
+        s_sys_clk_p <= '0';
+        s_sys_clk_n <= '1';
+        wait for CLK_PERIOD / 2;
+        s_sys_clk_p <= '1';
+        s_sys_clk_n <= '0';
+        wait for CLK_PERIOD / 2;
+    end process clk_process;
+
+    -- 6. Reset ve diğer giriş sinyallerini kontrol eden process (Stimulus)
+    stimulus_process: process
+    begin
+        -- Simülasyon başlangıcı
+        report "Test Bench Baslatildi. Reset uygulanacak.";
+        
+        -- Başlangıçta 10 saat periyodu boyunca reset sinyalini aktif et
+        s_reset_btn <= '1';
+        wait for 10 * CLK_PERIOD;
+        
+        -- Reset'i bırak
+        s_reset_btn <= '0';
+        report "Reset birakildi. DAC baslatma sekansi bekleniyor...";
+
+        -- dac_controller modülümüzün içinde yaklaşık 1 saniyelik bir bekleme var.
+        -- Bu beklemenin ve ardından gelen iki SPI transferinin tamamlanmasını
+        -- görmek için yeterince uzun süre bekleyelim.
+        wait for 1.1 sec;
+
+        report "Simulasyon tamamlandi." severity failure; -- 'failure' çoğu simülatörü durdurur.
+
+        -- Simülasyonu sonlandırmak için sonsuza kadar bekle
+        wait;
+    end process stimulus_process;
+
+end simulation; 
