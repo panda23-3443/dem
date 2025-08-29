@@ -1,0 +1,1046 @@
+-- SPI Master Modülü
+-- AD3552R DAC ile haberleşme için
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity spi_master is
+    Generic (
+        CLK_FREQ    : integer := 100_000_000;  -- System clock frequency (Hz)
+        SPI_FREQ    : integer := 10_000_000    -- SPI clock frequency (Hz)
+    );
+    Port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        
+        -- Control interface
+        start       : in  std_logic;
+        tx_data     : in  std_logic_vector(23 downto 0);  -- 24-bit frame for AD3552R
+        busy        : out std_logic;
+        done        : out std_logic;
+        rx_data     : out std_logic_vector(23 downto 0);
+        
+        -- SPI interface
+        spi_clk     : out std_logic;
+        spi_mosi    : out std_logic;
+        spi_miso    : in  std_logic;
+        spi_cs      : out std_logic
+    );
+end spi_master;
+
+architecture Behavioral of spi_master is
+    -- Clock divider for SPI clock
+    constant CLK_DIVIDER : integer := CLK_FREQ / (2 * SPI_FREQ);
+    
+    -- State machine
+    type state_type is (IDLE, START_TX, TRANSMIT, FINISH);
+    signal state : state_type := IDLE;
+    
+    -- Internal signals
+    signal clk_counter  : integer range 0 to CLK_DIVIDER := 0;
+    signal spi_clk_en   : std_logic := '0';
+    signal spi_clk_int  : std_logic := '0';
+    signal bit_counter  : integer range 0 to 24 := 0;
+    signal tx_shift_reg : std_logic_vector(23 downto 0) := (others => '0');
+    signal rx_shift_reg : std_logic_vector(23 downto 0) := (others => '0');
+    
+begin
+    
+    -- SPI clock generation
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            clk_counter <= 0;
+            spi_clk_en <= '0';
+        elsif rising_edge(clk) then
+            if clk_counter = CLK_DIVIDER-1 then
+                clk_counter <= 0;
+                spi_clk_en <= '1';
+            else
+                clk_counter <= clk_counter + 1;
+                spi_clk_en <= '0';
+            end if;
+        end if;
+    end process;
+    
+    -- SPI clock output
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            spi_clk_int <= '0';
+        elsif rising_edge(clk) then
+            if spi_clk_en = '1' and state = TRANSMIT then
+                spi_clk_int <= not spi_clk_int;
+            elsif state /= TRANSMIT then
+                spi_clk_int <= '0';  -- CPOL = 0 for AD3552R
+            end if;
+        end if;
+    end process;
+    
+    spi_clk <= spi_clk_int;
+    
+    -- Main SPI state machine
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            state <= IDLE;
+            spi_cs <= '1';
+            spi_mosi <= '0';
+            busy <= '0';
+            done <= '0';
+            bit_counter <= 0;
+            tx_shift_reg <= (others => '0');
+            rx_shift_reg <= (others => '0');
+            
+        elsif rising_edge(clk) then
+            done <= '0';
+            
+            case state is
+                when IDLE =>
+                    busy <= '0';
+                    spi_cs <= '1';
+                    spi_mosi <= '0';
+                    bit_counter <= 0;
+                    
+                    if start = '1' then
+                        tx_shift_reg <= tx_data;
+                        rx_shift_reg <= (others => '0');
+                        state <= START_TX;
+                        busy <= '1';
+                    end if;
+                
+                when START_TX =>
+                    spi_cs <= '0';  -- Chip select active
+                    bit_counter <= 24;
+                    state <= TRANSMIT;
+                
+                when TRANSMIT =>
+                    if spi_clk_en = '1' then
+                        if spi_clk_int = '0' then  -- CPHA = 0: data setup on falling edge
+                            spi_mosi <= tx_shift_reg(23);
+                            tx_shift_reg <= tx_shift_reg(22 downto 0) & '0';
+                            
+                        else  -- Rising edge: sample MISO
+                            rx_shift_reg <= rx_shift_reg(22 downto 0) & spi_miso;
+                            bit_counter <= bit_counter - 1;
+                            
+                            if bit_counter = 1 then
+                                state <= FINISH;
+                            end if;
+                        end if;
+                    end if;
+                
+                when FINISH =>
+                    spi_cs <= '1';
+                    spi_mosi <= '0';
+                    done <= '1';
+                    busy <= '0';
+                    state <= IDLE;
+                    
+            end case;
+        end if;
+    end process;
+    
+    rx_data <= rx_shift_reg;
+    
+end Behavioral;
+-- AD3552R DAC Controller Modülü
+-- 0-5V çıkış voltajı kontrolü için
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity ad3552r_controller is
+    Port (
+        clk             : in  std_logic;
+        reset           : in  std_logic;
+        
+        -- Control interface
+        voltage_set     : in  std_logic_vector(15 downto 0);  -- 0-65535 -> 0-5V
+        channel_sel     : in  std_logic;  -- 0: Channel A, 1: Channel B
+        update_req      : in  std_logic;
+        update_done     : out std_logic;
+        
+        -- SPI Master interface
+        spi_start       : out std_logic;
+        spi_tx_data     : out std_logic_vector(23 downto 0);
+        spi_busy        : in  std_logic;
+        spi_done        : in  std_logic;
+        
+        -- DAC control pins
+        dac_reset       : out std_logic;
+        dac_ldac        : out std_logic
+    );
+end ad3552r_controller;
+
+architecture Behavioral of ad3552r_controller is
+    
+    -- AD3552R Register Addresses
+    constant REG_INTERFACE_CONFIG_A : std_logic_vector(7 downto 0) := x"00";
+    constant REG_INTERFACE_CONFIG_B : std_logic_vector(7 downto 0) := x"01";
+    constant REG_DEVICE_CONFIG      : std_logic_vector(7 downto 0) := x"02";
+    constant REG_CHIP_TYPE          : std_logic_vector(7 downto 0) := x"03";
+    constant REG_PRODUCT_ID_L       : std_logic_vector(7 downto 0) := x"04";
+    constant REG_PRODUCT_ID_H       : std_logic_vector(7 downto 0) := x"05";
+    constant REG_CHIP_GRADE         : std_logic_vector(7 downto 0) := x"06";
+    constant REG_SCRATCH_PAD        : std_logic_vector(7 downto 0) := x"0A";
+    constant REG_SPI_REVISION       : std_logic_vector(7 downto 0) := x"0B";
+    constant REG_VENDOR_L           : std_logic_vector(7 downto 0) := x"0C";
+    constant REG_VENDOR_H           : std_logic_vector(7 downto 0) := x"0D";
+    constant REG_STREAM_MODE        : std_logic_vector(7 downto 0) := x"0E";
+    constant REG_TRANSFER_REGISTER  : std_logic_vector(7 downto 0) := x"0F";
+    constant REG_INTERFACE_CONFIG_C : std_logic_vector(7 downto 0) := x"10";
+    constant REG_INTERFACE_STATUS_A : std_logic_vector(7 downto 0) := x"11";
+    
+    -- DAC Channel Registers
+    constant REG_DAC_CONF_A         : std_logic_vector(7 downto 0) := x"20";
+    constant REG_DAC_CONF_B         : std_logic_vector(7 downto 0) := x"21";
+    constant REG_CH_INPUT_A         : std_logic_vector(7 downto 0) := x"40";
+    constant REG_CH_INPUT_B         : std_logic_vector(7 downto 0) := x"41";
+    
+    -- Commands
+    constant CMD_WRITE              : std_logic := '0';
+    constant CMD_READ               : std_logic := '1';
+    
+    -- State machine
+    type state_type is (IDLE, INIT_DAC, CONFIG_SPAN, WRITE_DAC_VALUE, WAIT_SPI, UPDATE_COMPLETE);
+    signal state : state_type := IDLE;
+    
+    -- Internal signals
+    signal init_counter    : integer range 0 to 10 := 0;
+    signal update_request  : std_logic := '0';
+    signal dac_value       : std_logic_vector(15 downto 0) := (others => '0');
+    signal selected_channel: std_logic := '0';
+    
+    -- Reset control
+    signal reset_counter   : integer range 0 to 1000 := 0;
+    signal dac_reset_int   : std_logic := '1';
+    
+begin
+    
+    -- DAC Reset sequence
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            reset_counter <= 0;
+            dac_reset_int <= '1';
+        elsif rising_edge(clk) then
+            if reset_counter < 1000 then  -- Hold reset for ~10µs at 100MHz
+                reset_counter <= reset_counter + 1;
+                dac_reset_int <= '1';
+            else
+                dac_reset_int <= '0';
+            end if;
+        end if;
+    end process;
+    
+    dac_reset <= dac_reset_int;
+    dac_ldac <= '0';  -- Continuous update mode
+    
+    -- Input synchronization
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            update_request <= '0';
+            dac_value <= (others => '0');
+            selected_channel <= '0';
+        elsif rising_edge(clk) then
+            if update_req = '1' and state = IDLE then
+                update_request <= '1';
+                dac_value <= voltage_set;
+                selected_channel <= channel_sel;
+            elsif state = UPDATE_COMPLETE then
+                update_request <= '0';
+            end if;
+        end if;
+    end process;
+    
+    -- Main controller state machine
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            state <= IDLE;
+            spi_start <= '0';
+            spi_tx_data <= (others => '0');
+            update_done <= '0';
+            init_counter <= 0;
+            
+        elsif rising_edge(clk) then
+            spi_start <= '0';
+            update_done <= '0';
+            
+            case state is
+                when IDLE =>
+                    if dac_reset_int = '0' and init_counter = 0 then
+                        -- Start initialization sequence
+                        state <= INIT_DAC;
+                        init_counter <= 1;
+                    elsif update_request = '1' and init_counter > 0 then
+                        -- Process voltage update request
+                        state <= CONFIG_SPAN;
+                    end if;
+                
+                when INIT_DAC =>
+                    if spi_busy = '0' then
+                        case init_counter is
+                            when 1 =>
+                                -- Configure interface for single SPI mode
+                                spi_tx_data <= CMD_WRITE & REG_INTERFACE_CONFIG_A & x"00" & "0000000";
+                                spi_start <= '1';
+                                init_counter <= 2;
+                                state <= WAIT_SPI;
+                            
+                            when 2 =>
+                                -- Configure device for normal operation
+                                spi_tx_data <= CMD_WRITE & REG_DEVICE_CONFIG & x"00" & "0000000";
+                                spi_start <= '1';
+                                init_counter <= 3;
+                                state <= WAIT_SPI;
+                                
+                            when others =>
+                                init_counter <= 10;  -- Initialization complete
+                                state <= IDLE;
+                        end case;
+                    end if;
+                
+                when CONFIG_SPAN =>
+                    if spi_busy = '0' then
+                        -- Configure DAC for 0-5V output span
+                        -- RANGE = 011 (0V to 2.5*GAIN) with GAIN=2 gives 0-5V
+                        if selected_channel = '0' then
+                            spi_tx_data <= CMD_WRITE & REG_DAC_CONF_A & "00011" & "010" & "0000000";
+                        else
+                            spi_tx_data <= CMD_WRITE & REG_DAC_CONF_B & "00011" & "010" & "0000000";
+                        end if;
+                        spi_start <= '1';
+                        state <= WAIT_SPI;
+                    end if;
+                
+                when WRITE_DAC_VALUE =>
+                    if spi_busy = '0' then
+                        -- Write DAC value
+                        if selected_channel = '0' then
+                            spi_tx_data <= CMD_WRITE & REG_CH_INPUT_A & dac_value;
+                        else
+                            spi_tx_data <= CMD_WRITE & REG_CH_INPUT_B & dac_value;
+                        end if;
+                        spi_start <= '1';
+                        state <= WAIT_SPI;
+                    end if;
+                
+                when WAIT_SPI =>
+                    if spi_done = '1' then
+                        if init_counter < 10 then
+                            state <= INIT_DAC;
+                        elsif update_request = '1' then
+                            state <= WRITE_DAC_VALUE;
+                        else
+                            state <= UPDATE_COMPLETE;
+                        end if;
+                    end if;
+                
+                when UPDATE_COMPLETE =>
+                    update_done <= '1';
+                    state <= IDLE;
+                    
+            end case;
+        end if;
+    end process;
+    
+end Behavioral;
+-- Voltage to DAC Code Converter
+-- 0-5V voltage range to 16-bit DAC code conversion
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity voltage_converter is
+    Port (
+        clk             : in  std_logic;
+        reset           : in  std_logic;
+        
+        -- Voltage input (scaled)
+        voltage_mv      : in  unsigned(15 downto 0);  -- Voltage in millivolts (0-5000)
+        convert_req     : in  std_logic;
+        
+        -- DAC code output
+        dac_code        : out std_logic_vector(15 downto 0);
+        convert_done    : out std_logic
+    );
+end voltage_converter;
+
+architecture Behavioral of voltage_converter is
+    
+    -- Constants for conversion
+    -- For 0-5V range with 16-bit resolution:
+    -- DAC_CODE = (VOLTAGE_mV * 65535) / 5000
+    -- Simplified: DAC_CODE = VOLTAGE_mV * 13.1071 ≈ VOLTAGE_mV * 13 + VOLTAGE_mV/8
+    
+    signal temp_result : unsigned(31 downto 0) := (others => '0');
+    signal convert_reg : std_logic := '0';
+    
+begin
+    
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            dac_code <= (others => '0');
+            convert_done <= '0';
+            temp_result <= (others => '0');
+            convert_reg <= '0';
+            
+        elsif rising_edge(clk) then
+            convert_done <= '0';
+            convert_reg <= convert_req;
+            
+            -- Detect rising edge of convert_req
+            if convert_req = '1' and convert_reg = '0' then
+                -- Perform conversion: (voltage_mv * 65535) / 5000
+                -- Using bit shifts for division: / 5000 ≈ * 13107 / 65536
+                temp_result <= voltage_mv * to_unsigned(13107, 16);
+                
+            elsif temp_result /= 0 then
+                -- Extract upper 16 bits (equivalent to division by 65536)
+                dac_code <= std_logic_vector(temp_result(31 downto 16));
+                temp_result <= (others => '0');
+                convert_done <= '1';
+            end if;
+        end if;
+    end process;
+    
+end Behavioral;
+-- Top Level Design for KC705 + AD3552R DAC
+-- 0-5V voltage control system
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity top_level is
+    Port (
+        -- System clock and reset
+        sys_clk_p       : in  std_logic;  -- 200 MHz differential clock
+        sys_clk_n       : in  std_logic;
+        sys_rst         : in  std_logic;  -- Reset button
+        
+        -- User interface (switches and buttons on KC705)
+        sw              : in  std_logic_vector(7 downto 0);   -- DIP switches
+        btn_center      : in  std_logic;  -- Center button
+        btn_north       : in  std_logic;  -- North button
+        btn_south       : in  std_logic;  -- South button
+        btn_west        : in  std_logic;  -- West button
+        btn_east        : in  std_logic;  -- East button
+        
+        -- LEDs for status indication
+        led             : out std_logic_vector(7 downto 0);
+        
+        -- SPI interface to AD3552R (FMC LPC connector)
+        fmc_spi_clk     : out std_logic;  -- LA00_CC_P
+        fmc_spi_mosi    : out std_logic;  -- LA00_CC_N
+        fmc_spi_miso    : in  std_logic;  -- LA01_CC_P
+        fmc_spi_cs      : out std_logic;  -- LA01_CC_N
+        
+        -- DAC control signals
+        fmc_dac_reset   : out std_logic;  -- LA02_P
+        fmc_dac_ldac    : out std_logic   -- LA02_N
+    );
+end top_level;
+
+architecture Behavioral of top_level is
+    
+    -- Component declarations
+    component spi_master is
+        Generic (
+            CLK_FREQ    : integer := 100_000_000;
+            SPI_FREQ    : integer := 10_000_000
+        );
+        Port (
+            clk         : in  std_logic;
+            reset       : in  std_logic;
+            start       : in  std_logic;
+            tx_data     : in  std_logic_vector(23 downto 0);
+            busy        : out std_logic;
+            done        : out std_logic;
+            rx_data     : out std_logic_vector(23 downto 0);
+            spi_clk     : out std_logic;
+            spi_mosi    : out std_logic;
+            spi_miso    : in  std_logic;
+            spi_cs      : out std_logic
+        );
+    end component;
+    
+    component ad3552r_controller is
+        Port (
+            clk             : in  std_logic;
+            reset           : in  std_logic;
+            voltage_set     : in  std_logic_vector(15 downto 0);
+            channel_sel     : in  std_logic;
+            update_req      : in  std_logic;
+            update_done     : out std_logic;
+            spi_start       : out std_logic;
+            spi_tx_data     : out std_logic_vector(23 downto 0);
+            spi_busy        : in  std_logic;
+            spi_done        : in  std_logic;
+            dac_reset       : out std_logic;
+            dac_ldac        : out std_logic
+        );
+    end component;
+    
+    component voltage_converter is
+        Port (
+            clk             : in  std_logic;
+            reset           : in  std_logic;
+            voltage_mv      : in  unsigned(15 downto 0);
+            convert_req     : in  std_logic;
+            dac_code        : out std_logic_vector(15 downto 0);
+            convert_done    : out std_logic
+        );
+    end component;
+    
+    -- Clock and reset signals
+    signal clk_100mhz       : std_logic;
+    signal reset_sync       : std_logic;
+    signal reset_counter    : unsigned(7 downto 0) := (others => '0');
+    
+    -- User interface signals
+    signal voltage_mv       : unsigned(15 downto 0) := (others => '0');
+    signal channel_select   : std_logic := '0';
+    signal update_trigger   : std_logic := '0';
+    signal btn_center_reg   : std_logic := '0';
+    signal btn_north_reg    : std_logic := '0';
+    signal btn_south_reg    : std_logic := '0';
+    
+    -- Internal control signals
+    signal dac_code         : std_logic_vector(15 downto 0);
+    signal convert_done     : std_logic;
+    signal update_done      : std_logic;
+    signal spi_busy         : std_logic;
+    
+    -- SPI interface signals
+    signal spi_start        : std_logic;
+    signal spi_tx_data      : std_logic_vector(23 downto 0);
+    signal spi_done         : std_logic;
+    signal spi_rx_data      : std_logic_vector(23 downto 0);
+    
+    -- Status and control
+    signal system_ready     : std_logic := '0';
+    signal voltage_step     : unsigned(15 downto 0) := to_unsigned(100, 16);  -- 100mV steps
+    
+begin
+    
+    -- Clock generation (simplified - use MMCM in real design)
+    -- For now, assume we have a 100MHz clock
+    clk_100mhz <= sys_clk_p;  -- This is simplified!
+    
+    -- Reset synchronization
+    process(clk_100mhz)
+    begin
+        if rising_edge(clk_100mhz) then
+            if sys_rst = '1' then
+                reset_counter <= (others => '0');
+                reset_sync <= '1';
+            elsif reset_counter = X"FF" then
+                reset_sync <= '0';
+            else
+                reset_counter <= reset_counter + 1;
+                reset_sync <= '1';
+            end if;
+        end if;
+    end process;
+    
+    -- User interface control
+    process(clk_100mhz, reset_sync)
+    begin
+        if reset_sync = '1' then
+            voltage_mv <= (others => '0');
+            channel_select <= '0';
+            update_trigger <= '0';
+            btn_center_reg <= '0';
+            btn_north_reg <= '0';
+            btn_south_reg <= '0';
+            system_ready <= '0';
+            
+        elsif rising_edge(clk_100mhz) then
+            update_trigger <= '0';
+            btn_center_reg <= btn_center;
+            btn_north_reg <= btn_north;
+            btn_south_reg <= btn_south;
+            
+            -- System ready after some delay
+            if reset_counter = X"FF" then
+                system_ready <= '1';
+            end if;
+            
+            if system_ready = '1' then
+                -- Voltage control with buttons
+                if btn_north = '1' and btn_north_reg = '0' then  -- Rising edge
+                    if voltage_mv < 4900 then  -- Limit to 4.9V
+                        voltage_mv <= voltage_mv + voltage_step;
+                        update_trigger <= '1';
+                    end if;
+                    
+                elsif btn_south = '1' and btn_south_reg = '0' then  -- Rising edge
+                    if voltage_mv >= voltage_step then
+                        voltage_mv <= voltage_mv - voltage_step;
+                        update_trigger <= '1';
+                    else
+                        voltage_mv <= (others => '0');
+                        update_trigger <= '1';
+                    end if;
+                    
+                -- Channel selection
+                elsif btn_east = '1' then
+                    channel_select <= '1';  -- Channel B
+                elsif btn_west = '1' then
+                    channel_select <= '0';  -- Channel A
+                    
+                -- Manual update trigger
+                elsif btn_center = '1' and btn_center_reg = '0' then
+                    update_trigger <= '1';
+                end if;
+                
+                -- Switch-based voltage setting (coarse)
+                if sw /= "00000000" then
+                    voltage_mv <= unsigned(sw) * to_unsigned(625, 16);  -- Each switch = 625mV
+                end if;
+            end if;
+        end if;
+    end process;
+    
+    -- Status LEDs
+    led(0) <= system_ready;
+    led(1) <= channel_select;
+    led(2) <= spi_busy;
+    led(3) <= update_done;
+    led(7 downto 4) <= std_logic_vector(voltage_mv(11 downto 8));  -- Show upper voltage bits
+    
+    -- Component instantiations
+    voltage_conv_inst: voltage_converter
+        port map (
+            clk         => clk_100mhz,
+            reset       => reset_sync,
+            voltage_mv  => voltage_mv,
+            convert_req => update_trigger,
+            dac_code    => dac_code,
+            convert_done => convert_done
+        );
+    
+    dac_controller_inst: ad3552r_controller
+        port map (
+            clk         => clk_100mhz,
+            reset       => reset_sync,
+            voltage_set => dac_code,
+            channel_sel => channel_select,
+            update_req  => convert_done,
+            update_done => update_done,
+            spi_start   => spi_start,
+            spi_tx_data => spi_tx_data,
+            spi_busy    => spi_busy,
+            spi_done    => spi_done,
+            dac_reset   => fmc_dac_reset,
+            dac_ldac    => fmc_dac_ldac
+        );
+    
+    spi_master_inst: spi_master
+        generic map (
+            CLK_FREQ => 100_000_000,
+            SPI_FREQ => 10_000_000
+        )
+        port map (
+            clk      => clk_100mhz,
+            reset    => reset_sync,
+            start    => spi_start,
+            tx_data  => spi_tx_data,
+            busy     => spi_busy,
+            done     => spi_done,
+            rx_data  => spi_rx_data,
+            spi_clk  => fmc_spi_clk,
+            spi_mosi => fmc_spi_mosi,
+            spi_miso => fmc_spi_miso,
+            spi_cs   => fmc_spi_cs
+        );
+    
+end Behavioral;
+# KC705 + AD3552R DAC Pin Constraints
+# Constraint file for Vivado
+
+# System Clock (200 MHz differential)
+set_property PACKAGE_PIN AD12 [get_ports sys_clk_p]
+set_property PACKAGE_PIN AD11 [get_ports sys_clk_n]
+set_property IOSTANDARD LVDS [get_ports sys_clk_p]
+set_property IOSTANDARD LVDS [get_ports sys_clk_n]
+
+# System Reset
+set_property PACKAGE_PIN AB7 [get_ports sys_rst]
+set_property IOSTANDARD LVCMOS15 [get_ports sys_rst]
+
+# User DIP Switches
+set_property PACKAGE_PIN Y29 [get_ports {sw[0]}]
+set_property PACKAGE_PIN W29 [get_ports {sw[1]}]
+set_property PACKAGE_PIN AA28 [get_ports {sw[2]}]
+set_property PACKAGE_PIN Y28 [get_ports {sw[3]}]
+set_property PACKAGE_PIN AA26 [get_ports {sw[4]}]
+set_property PACKAGE_PIN Y26 [get_ports {sw[5]}]
+set_property PACKAGE_PIN W26 [get_ports {sw[6]}]
+set_property PACKAGE_PIN V26 [get_ports {sw[7]}]
+set_property IOSTANDARD LVCMOS25 [get_ports {sw[*]}]
+set_property PULLUP true [get_ports {sw[*]}]
+
+# Push Buttons
+set_property PACKAGE_PIN G12 [get_ports btn_center]
+set_property PACKAGE_PIN AA12 [get_ports btn_north]
+set_property PACKAGE_PIN AB12 [get_ports btn_south]
+set_property PACKAGE_PIN AC6 [get_ports btn_west]
+set_property PACKAGE_PIN AG5 [get_ports btn_east]
+set_property IOSTANDARD LVCMOS15 [get_ports btn_*]
+
+# User LEDs
+set_property PACKAGE_PIN AB8 [get_ports {led[0]}]
+set_property PACKAGE_PIN AA8 [get_ports {led[1]}]
+set_property PACKAGE_PIN AC9 [get_ports {led[2]}]
+set_property PACKAGE_PIN AB9 [get_ports {led[3]}]
+set_property PACKAGE_PIN AE26 [get_ports {led[4]}]
+set_property PACKAGE_PIN G19 [get_ports {led[5]}]
+set_property PACKAGE_PIN E18 [get_ports {led[6]}]
+set_property PACKAGE_PIN F16 [get_ports {led[7]}]
+set_property IOSTANDARD LVCMOS15 [get_ports {led[0]}]
+set_property IOSTANDARD LVCMOS15 [get_ports {led[1]}]
+set_property IOSTANDARD LVCMOS15 [get_ports {led[2]}]
+set_property IOSTANDARD LVCMOS15 [get_ports {led[3]}]
+set_property IOSTANDARD LVCMOS25 [get_ports {led[4]}]
+set_property IOSTANDARD LVCMOS25 [get_ports {led[5]}]
+set_property IOSTANDARD LVCMOS25 [get_ports {led[6]}]
+set_property IOSTANDARD LVCMOS25 [get_ports {led[7]}]
+
+# FMC LPC Connector - AD3552R DAC Interface
+# Note: These are typical FMC pin assignments - verify with your specific FMC card
+
+# SPI Interface
+set_property PACKAGE_PIN H19 [get_ports fmc_spi_clk]     # LA00_CC_P
+set_property PACKAGE_PIN H20 [get_ports fmc_spi_mosi]    # LA00_CC_N
+set_property PACKAGE_PIN G21 [get_ports fmc_spi_miso]    # LA01_CC_P
+set_property PACKAGE_PIN G22 [get_ports fmc_spi_cs]      # LA01_CC_N
+set_property IOSTANDARD LVCMOS25 [get_ports fmc_spi_clk]
+set_property IOSTANDARD LVCMOS25 [get_ports fmc_spi_mosi]
+set_property IOSTANDARD LVCMOS25 [get_ports fmc_spi_miso]
+set_property IOSTANDARD LVCMOS25 [get_ports fmc_spi_cs]
+
+# DAC Control Signals
+set_property PACKAGE_PIN J16 [get_ports fmc_dac_reset]   # LA02_P
+set_property PACKAGE_PIN J17 [get_ports fmc_dac_ldac]    # LA02_N
+set_property IOSTANDARD LVCMOS25 [get_ports fmc_dac_reset]
+set_property IOSTANDARD LVCMOS25 [get_ports fmc_dac_ldac]
+
+# Drive Strength and Slew Rate
+set_property DRIVE 4 [get_ports fmc_spi_clk]
+set_property DRIVE 4 [get_ports fmc_spi_mosi]
+set_property DRIVE 4 [get_ports fmc_spi_cs]
+set_property DRIVE 4 [get_ports fmc_dac_reset]
+set_property DRIVE 4 [get_ports fmc_dac_ldac]
+set_property SLEW FAST [get_ports fmc_spi_clk]
+set_property SLEW FAST [get_ports fmc_spi_mosi]
+set_property SLEW FAST [get_ports fmc_spi_cs]
+
+# Clock Constraints
+create_clock -period 5.000 -name sys_clk -waveform {0.000 2.500} [get_ports sys_clk_p]
+set_input_jitter sys_clk 0.050
+
+# Generated SPI Clock Constraint
+create_generated_clock -name spi_clk -source [get_pins spi_master_inst/clk] -divide_by 10 [get_ports fmc_spi_clk]
+
+# Input/Output Delays for SPI Interface
+set_output_delay -clock [get_clocks spi_clk] -max 2.000 [get_ports {fmc_spi_mosi fmc_spi_cs}]
+set_output_delay -clock [get_clocks spi_clk] -min -1.000 [get_ports {fmc_spi_mosi fmc_spi_cs}]
+set_input_delay -clock [get_clocks spi_clk] -max 2.000 [get_ports fmc_spi_miso]
+set_input_delay -clock [get_clocks spi_clk] -min -1.000 [get_ports fmc_spi_miso]
+
+# False Paths for Control Signals
+set_false_path -from [get_ports {sw[*] btn_*}]
+set_false_path -to [get_ports {led[*]}]
+set_false_path -from [get_ports sys_rst]
+set_false_path -to [get_ports {fmc_dac_reset fmc_dac_ldac}]
+
+# Multi-cycle paths for slow control logic
+set_multicycle_path -setup 2 -from [get_cells -hierarchical -filter {NAME =~ "*voltage_mv_reg*"}] -to [get_cells -hierarchical -filter {NAME =~ "*dac_code_reg*"}]
+set_multicycle_path -hold 1 -from [get_cells -hierarchical -filter {NAME =~ "*voltage_mv_reg*"}] -to [get_cells -hierarchical -filter {NAME =~ "*dac_code_reg*"}]
+
+# Configuration
+set_property CFGBVS VCCO [current_design]
+set_property CONFIG_VOLTAGE 2.5 [current_design]
+set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 4 [current_design]
+set_property BITSTREAM.CONFIG.CONFIGRATE 40 [current_design]
+-- Voltage Converter Testbench
+-- 0-5V to DAC code conversion test
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity tb_voltage_converter is
+end tb_voltage_converter;
+
+architecture sim of tb_voltage_converter is
+    
+    -- Component declaration
+    component voltage_converter is
+        Port (
+            clk             : in  std_logic;
+            reset           : in  std_logic;
+            voltage_mv      : in  unsigned(15 downto 0);
+            convert_req     : in  std_logic;
+            dac_code        : out std_logic_vector(15 downto 0);
+            convert_done    : out std_logic
+        );
+    end component;
+    
+    -- Test signals
+    signal clk              : std_logic := '0';
+    signal reset            : std_logic := '1';
+    signal voltage_mv       : unsigned(15 downto 0) := (others => '0');
+    signal convert_req      : std_logic := '0';
+    signal dac_code         : std_logic_vector(15 downto 0);
+    signal convert_done     : std_logic;
+    
+    -- Test control
+    constant CLK_PERIOD     : time := 10 ns;
+    signal test_case        : integer := 0;
+    
+    -- Test vectors: voltage_mv, expected_dac_code
+    type test_vector is record
+        voltage_mv      : unsigned(15 downto 0);
+        expected_dac    : unsigned(15 downto 0);
+        description     : string(1 to 20);
+    end record;
+    
+    type test_vector_array is array(0 to 10) of test_vector;
+    constant TEST_VECTORS : test_vector_array := (
+        (to_unsigned(0, 16),    to_unsigned(0, 16),        "0.000V -> 0x0000   "),      -- 0V
+        (to_unsigned(625, 16),  to_unsigned(8192, 16),     "0.625V -> 0x2000   "),      -- 0.625V
+        (to_unsigned(1250, 16), to_unsigned(16384, 16),    "1.250V -> 0x4000   "),      -- 1.25V
+        (to_unsigned(2500, 16), to_unsigned(32768, 16),    "2.500V -> 0x8000   "),      -- 2.5V
+        (to_unsigned(3750, 16), to_unsigned(49152, 16),    "3.750V -> 0xC000   "),      -- 3.75V
+        (to_unsigned(5000, 16), to_unsigned(65535, 16),    "5.000V -> 0xFFFF   "),      -- 5V (max)
+        (to_unsigned(100, 16),  to_unsigned(1311, 16),     "0.100V -> 0x051F   "),      -- 100mV
+        (to_unsigned(500, 16),  to_unsigned(6553, 16),     "0.500V -> 0x1999   "),      -- 500mV
+        (to_unsigned(1000, 16), to_unsigned(13107, 16),    "1.000V -> 0x3333   "),      -- 1V
+        (to_unsigned(4500, 16), to_unsigned(58981, 16),    "4.500V -> 0xE665   "),      -- 4.5V
+        (to_unsigned(4999, 16), to_unsigned(65522, 16),    "4.999V -> 0xFFF2   ")       -- 4.999V
+    );
+    
+begin
+    
+    -- Instantiate Unit Under Test (UUT)
+    uut: voltage_converter
+        port map (
+            clk         => clk,
+            reset       => reset,
+            voltage_mv  => voltage_mv,
+            convert_req => convert_req,
+            dac_code    => dac_code,
+            convert_done => convert_done
+        );
+    
+    -- Clock generation
+    clk <= not clk after CLK_PERIOD/2;
+    
+    -- Main test process
+    main_test: process
+        
+        procedure test_conversion(
+            input_voltage : unsigned(15 downto 0);
+            expected_code : unsigned(15 downto 0);
+            test_name : string
+        ) is
+            variable actual_code : unsigned(15 downto 0);
+            variable error_ppm : integer;
+            variable tolerance : unsigned(15 downto 0) := to_unsigned(10, 16);  -- ±10 LSB tolerance
+        begin
+            
+            report "Testing: " & test_name;
+            
+            voltage_mv <= input_voltage;
+            wait for 20 ns;
+            
+            -- Trigger conversion
+            convert_req <= '1';
+            wait for 20 ns;
+            convert_req <= '0';
+            
+            -- Wait for conversion completion
+            wait until convert_done = '1' for 10 us;
+            assert convert_done = '1' 
+                report "ERROR: " & test_name & " - Conversion not completed"
+                severity error;
+            
+            -- Check result accuracy
+            actual_code := unsigned(dac_code);
+            
+            if actual_code > expected_code then
+                error_ppm := to_integer(actual_code - expected_code);
+            else
+                error_ppm := to_integer(expected_code - actual_code);
+            end if;
+            
+            assert error_ppm <= to_integer(tolerance)
+                report "ERROR: " & test_name & " - Conversion error too large: " &
+                       "Expected 0x" & to_hstring(std_logic_vector(expected_code)) & 
+                       " Got 0x" & to_hstring(dac_code) &
+                       " Error: " & integer'image(error_ppm) & " LSB"
+                severity error;
+            
+            report "PASS: " & test_name & " - Expected: 0x" & to_hstring(std_logic_vector(expected_code)) &
+                   " Actual: 0x" & to_hstring(dac_code) & " Error: " & integer'image(error_ppm) & " LSB";
+            
+            wait for 1 us;
+        end procedure;
+        
+        procedure test_edge_cases is
+        begin
+            report "=== Testing Edge Cases ===";
+            
+            -- Test multiple rapid conversions
+            for i in 0 to 4 loop
+                voltage_mv <= to_unsigned(i * 1000, 16);  -- 0V, 1V, 2V, 3V, 4V
+                convert_req <= '1';
+                wait for 20 ns;
+                convert_req <= '0';
+                wait until convert_done = '1';
+                wait for 20 ns;
+            end loop;
+            
+            report "PASS: Rapid conversion test completed";
+            
+            -- Test conversion during reset
+            voltage_mv <= to_unsigned(2500, 16);
+            convert_req <= '1';
+            reset <= '1';
+            wait for 100 ns;
+            reset <= '0';
+            wait for 100 ns;
+            
+            assert convert_done = '0' 
+                report "PASS: Conversion properly reset during reset pulse"
+                severity note;
+                
+        end procedure;
+        
+    begin
+        
+        -- Test Case 0: Reset Test
+        test_case <= 0;
+        report "=== Test Case 0: Reset Test ===";
+        
+        reset <= '1';
+        wait for 100 ns;
+        reset <= '0';
+        wait for 50 ns;
+        
+        assert convert_done = '0' report "ERROR: Convert done should be '0' after reset" severity error;
+        assert dac_code = x"0000" report "ERROR: DAC code should be 0 after reset" severity error;
+        report "PASS: Reset test successful";
+        
+        -- Test Case 1: Standard Voltage Conversions
+        test_case <= 1;
+        report "=== Test Case 1: Standard Voltage Conversion Tests ===";
+        
+        -- Run all test vectors
+        for i in TEST_VECTORS'range loop
+            test_conversion(
+                TEST_VECTORS(i).voltage_mv,
+                TEST_VECTORS(i).expected_dac,
+                TEST_VECTORS(i).description
+            );
+        end loop;
+        
+        -- Test Case 2: Boundary Conditions
+        test_case <= 2;
+        report "=== Test Case 2: Boundary Condition Tests ===";
+        
+        -- Test minimum value
+        test_conversion(to_unsigned(0, 16), to_unsigned(0, 16), "Minimum: 0mV");
+        
+        -- Test maximum value
+        test_conversion(to_unsigned(5000, 16), to_unsigned(65535, 16), "Maximum: 5000mV");
+        
+        -- Test just below maximum
+        test_conversion(to_unsigned(4999, 16), to_unsigned(65522, 16), "Near Max: 4999mV");
+        
+        -- Test just above minimum
+        test_conversion(to_unsigned(1, 16), to_unsigned(13, 16), "Near Min: 1mV");
+        
+        -- Test Case 3: Linearity Test
+        test_case <= 3;
+        report "=== Test Case 3: Linearity Test ===";
+        
+        for i in 0 to 20 loop
+            declare
+                voltage : unsigned(15 downto 0) := to_unsigned(i * 250, 16);  -- 0 to 5000mV in 250mV steps
+                expected : unsigned(15 downto 0) := to_unsigned((i * 250 * 65535) / 5000, 16);
+            begin
+                test_conversion(voltage, expected, "Linear step " & integer'image(i));
+            end;
+        end loop;
+        
+        -- Test Case 4: Edge Cases
+        test_case <= 4;
+        test_edge_cases;
+        
+        -- Test Case 5: Conversion Speed Test
+        test_case <= 5;
+        report "=== Test Case 5: Conversion Speed Test ===";
+        
+        -- Test conversion latency
+        voltage_mv <= to_unsigned(2500, 16);
+        convert_req <= '1';
+        wait for 20 ns;
+        convert_req <= '0';
+        
+        -- Measure time to done
+        wait until convert_done = '1' for 1 us;
+        assert convert_done = '1' 
+            report "ERROR: Conversion taking too long (>1us)"
+            severity error;
+            
+        report "PASS: Conversion speed acceptable";
+        
+        -- Final summary
+        test_case <= 99;
+        report "=== ALL VOLTAGE CONVERTER TESTS COMPLETED SUCCESSFULLY ===";
+        
+        wait;
+        
+    end process;
+    
+    -- Conversion accuracy monitor
+    accuracy_monitor: process
+        variable voltage_real : real;
+        variable dac_real : real;
+        variable expected_real : real;
+        variable error_percent : real;
+    begin
+        wait until convert_done = '1';
+        
+        -- Calculate real values for reporting
+        voltage_real := real(to_integer(voltage_mv)) / 1000.0;  -- Convert mV to V
+        dac_real := real(to_integer(unsigned(dac_code)));
+        expected_real := voltage_real * 65535.0 / 5.0;
+        
+        if expected_real > 0.0 then
+            error_percent := abs(dac_real - expected_real) / expected_real * 100.0;
+            
+            if error_percent > 1.0 then  -- >1% error
+                report "WARNING: High conversion error: " & 
+                       real'image(error_percent) & "%" 
+                       severity warning;
+            end if;
+        end if;
+        
+        report "Conversion: " & real'image(voltage_real) & "V -> 0x" & 
+               to_hstring(dac_code) & " (Error: " & real'image(error_percent) & "%)";
+               
+    end process;
+    
+end sim;
