@@ -443,3 +443,17 @@ begin
   end process;
 
 end architecture;
+## System clock (200 MHz KC705 osilatör)
+create_clock -name sysclk -period 5.000 [get_ports sys_clk]
+
+## IO standardları (FMC LVCMOS18 çalışıyor)
+set_property IOSTANDARD LVCMOS18 [get_ports {spi_sclk spi_cs_n spi_mosi spi_miso ad_reset_n ad_ldac_n ad_alert_n}]
+
+## Pin mapping (örnek – kesin FMC tablosundan doldur)
+set_property PACKAGE_PIN Y23 [get_ports spi_sclk]     ; # FMC LA00_CC_P
+set_property PACKAGE_PIN AA23 [get_ports spi_cs_n]    ; # FMC LA00_CC_N
+set_property PACKAGE_PIN W21 [get_ports spi_mosi]     ; # FMC LA01_P
+set_property PACKAGE_PIN V21 [get_ports spi_miso]     ; # FMC LA01_N
+set_property PACKAGE_PIN AB20 [get_ports ad_reset_n]  ; # FMC LA02_P
+set_property PACKAGE_PIN AC20 [get_ports ad_ldac_n]   ; # FMC LA02_N
+set_property PACKAGE_PIN Y20 [get_ports ad_alert_n]   ; # FMC LA03_P
